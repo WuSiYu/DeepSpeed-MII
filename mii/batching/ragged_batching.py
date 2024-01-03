@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 import copy
+from dataclasses import dataclass
 import gc
 import os
 import queue
@@ -53,6 +54,7 @@ from mii.batching.postprocess import (
 from mii.batching.utils import sync_debug, profiler
 from mii.constants import GenerationFinishReason, ZMQ_RECV_TIMEOUT
 from mii.logging import logger
+from mii.modeling.tokenizers import MIITokenizerWrapper
 
 
 class RaggedBatchBase:
@@ -464,10 +466,49 @@ class RaggedBatchBase:
             self.inference_engine.flush(uid)
 
 
+@dataclass
+class StreamState:
+    prev_token: str
+    token_ids: List[int]
+
+
+class ReadableStream():
+    def __init__(self, tokenizer: MIITokenizerWrapper) -> None:
+        self.tokenizer: MIITokenizerWrapper = tokenizer
+        self.stream_state: Dict[int, StreamState] = {}
+
+    def init_state(self, thread_id: int) -> StreamState:
+        if thread_id not in self.stream_state:
+            self.stream_state[thread_id] = StreamState(prev_token=None, token_ids=[])
+        return self.stream_state[thread_id]
+
+    def flush_state(self, thread_id: int) -> None:
+        if thread_id in self.stream_state:
+            del self.stream_state[thread_id]
+
+    def decode(self, thread_id: int, token_ids: List[int]) -> str:
+        sstate = self.init_state(thread_id)
+        final = []
+        for token_id in token_ids:
+            sstate.token_ids.append(token_id)
+            r = self.tokenizer.decode(sstate.token_ids)
+            if " " in r:
+                if sstate.prev_token is not None:
+                    r = r.replace(sstate.prev_token, "")
+                    sstate.token_ids = [sstate.token_ids[-1]]
+            elif len(sstate.token_ids) > 1:
+                sstate.token_ids.pop(0)
+                r = r.replace(sstate.prev_token, "")
+            sstate.prev_token = self.tokenizer.decode(token_id)
+            final.append(r)
+        return "".join(final)
+
+
 class MIIPipeline(RaggedBatchBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tid = threading.get_ident()
+        self.readable_stream = ReadableStream(self.tokenizer)
         self._destroyed = False
 
     def __call__(self, inputs: Union[str, List[str]], **kwargs) -> List[Response]:
@@ -524,10 +565,15 @@ class MIIPipeline(RaggedBatchBase):
         self.request_queue.put(request)
 
     def _get_response(self) -> Tuple[int, Response]:
-        result = self.result_queues[self.tid].get()
-        uid = result[0]
-        generated_tokens = self.tokenizer.decode(result[1])
-        response = self.make_response(generated_tokens, result[2], result[3], result[4])
+        uid, generated_token_ids, prompt_length, generated_length, finish_reason, streaming = self.result_queues[self.tid].get()
+        if len(generated_token_ids) == 0:
+            generated_texts = ""
+            self.readable_stream.flush_state(self.tid)
+        elif streaming:
+            generated_texts = self.readable_stream.decode(self.tid, generated_token_ids)
+        else:
+            generated_texts = self.tokenizer.decode(generated_token_ids)
+        response = self.make_response(generated_texts, prompt_length, generated_length, finish_reason)
         return uid, response
 
     def _bcast_responses(self, responses: List[Response]) -> List[Response]:
@@ -557,6 +603,7 @@ class MIIAsyncPipeline(RaggedBatchBase):
         self.lock = threading.Lock()
         self.thread = None
         self.stop_thread = False
+        self.readable_stream = ReadableStream(self.tokenizer)
         self._is_shutdown = False
         self.UID_RANGE_LB = 1
         self.UID_RANGE_UB = 10000
@@ -622,8 +669,9 @@ class MIIAsyncPipeline(RaggedBatchBase):
         generated_token_ids = result[1]
         if len(generated_token_ids) == 0:
             generated_text = ""
+            self.readable_stream.flush_state(tid)
         else:
-            generated_text = self.tokenizer.decode(generated_token_ids)
+            generated_text = self.readable_stream.decode(tid, generated_token_ids)
         response = self.make_response(generated_text, result[2], result[3], result[4])
         return uid, response
 
